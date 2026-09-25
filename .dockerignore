@@ -1,0 +1,7 @@
+**/node_modules
+**/dist
+.git
+infra/aws/certs
+infra/aws/out.env
+**/.env
+**/*.tsbuildinfo

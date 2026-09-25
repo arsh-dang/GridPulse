@@ -1,0 +1,61 @@
+[
+  {
+    "id": "gridpulse-flow-tab",
+    "type": "tab",
+    "label": "GridPulse Dispatch",
+    "disabled": false,
+    "info": "Threshold dispatch rule: if VIC price > $300/MWh, publish a dispatch decision. Stands in for dispatch-optimizer-service until it exists."
+  },
+  {
+    "id": "gridpulse-mqtt-broker",
+    "type": "mqtt-broker",
+    "name": "GridPulse broker",
+    "broker": "localhost",
+    "port": "1883",
+    "clientid": "",
+    "autoConnect": true,
+    "usetls": false,
+    "compatmode": false,
+    "protocolVersion": "4",
+    "keepalive": "60",
+    "cleansession": true
+  },
+  {
+    "id": "gridpulse-price-in",
+    "type": "mqtt in",
+    "z": "gridpulse-flow-tab",
+    "name": "price VIC",
+    "topic": "gridpulse/price/VIC",
+    "qos": "2",
+    "datatype": "json",
+    "broker": "gridpulse-mqtt-broker",
+    "x": 160,
+    "y": 120,
+    "wires": [["gridpulse-spike-check"]]
+  },
+  {
+    "id": "gridpulse-spike-check",
+    "type": "function",
+    "z": "gridpulse-flow-tab",
+    "name": "if price > $300/MWh",
+    "func": "const event = msg.payload;\nif (!event || typeof event.priceAudMwh !== 'number') {\n    node.warn('Dropping message with no priceAudMwh: ' + JSON.stringify(event));\n    return null;\n}\n\nconst THRESHOLD = 300;\nif (event.priceAudMwh <= THRESHOLD) {\n    return null;\n}\n\nmsg.payload = {\n    type: 'DispatchDecision',\n    region: event.region,\n    action: 'DISCHARGE',\n    reason: `price spike $${event.priceAudMwh}/MWh > $${THRESHOLD} threshold`,\n    ts: new Date().toISOString()\n};\nreturn msg;",
+    "outputs": 1,
+    "noerr": 0,
+    "x": 400,
+    "y": 120,
+    "wires": [["gridpulse-dispatch-out"]]
+  },
+  {
+    "id": "gridpulse-dispatch-out",
+    "type": "mqtt out",
+    "z": "gridpulse-flow-tab",
+    "name": "dispatch VIC",
+    "topic": "gridpulse/dispatch/VIC",
+    "qos": "2",
+    "retain": "false",
+    "broker": "gridpulse-mqtt-broker",
+    "x": 640,
+    "y": 120,
+    "wires": []
+  }
+]
