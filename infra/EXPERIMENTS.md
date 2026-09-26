@@ -12,7 +12,7 @@ the service to scale back to one task, then pulls the CloudWatch metrics into
 | E3 | 50,000 | sod-aware | Ten times the fleet with edge filtering: does it fit in the capacity E1 needed |
 
 All three use the same scenario: normal price for 2 minutes, then a $450/MWh
-spike for the remaining 13 minutes. Each battery is sampled every 6.25 s.
+spike for the remaining 8 minutes. Each battery is sampled every 6.25 s.
 
 ## Before you start
 
@@ -30,23 +30,21 @@ WAITING 0 and DESIRED 1. Stop it with Ctrl-C.
 
 ## Run the experiments
 
-Use tmux with two panes: `05-watch.sh` in one (for screenshots), the
-experiment in the other. Run them one after another; each takes about
-25 to 30 minutes including scale-in.
+Each experiment is one short command. The settings live inside
+`08-run-experiment.sh`, and the script checks the load generator's startup
+line against them, stopping straight away if they disagree.
 
 ```bash
-# E1: baseline
-EDGE_MODE=periodic BATTERIES=5000 SAMPLE_RATE=800 CONNECTIONS=12 DURATION_S=900 SPIKE_AT_S=120 \
-  bash infra/aws/08-run-experiment.sh E1-periodic-5k
-
-# E2: edge filtering, same fleet
-EDGE_MODE=sod-aware DELTA=0.01 HEARTBEAT_S=120 BATTERIES=5000 SAMPLE_RATE=800 CONNECTIONS=12 DURATION_S=900 SPIKE_AT_S=120 \
-  bash infra/aws/08-run-experiment.sh E2-edge-5k
-
-# E3: edge filtering, 10x fleet
-EDGE_MODE=sod-aware DELTA=0.01 HEARTBEAT_S=120 BATTERIES=50000 SAMPLE_RATE=8000 CONNECTIONS=60 DURATION_S=900 SPIKE_AT_S=120 \
-  bash infra/aws/08-run-experiment.sh E3-edge-50k
+bash infra/aws/08-run-experiment.sh E1-periodic-5k
+bash infra/aws/08-run-experiment.sh E2-edge-5k
+bash infra/aws/08-run-experiment.sh E3-edge-50k
 ```
+
+All three run for 10 minutes with the spike at 2 minutes, sampling each
+battery every 6.25 s. E2 and E3 use send-on-delta with a 1% delta, a 120 s
+heartbeat and the price-class flush. Each takes about 20 to 25 minutes
+including scale-in. The script logs the queue and task counts every 15 s to
+`results/<label>-watch.log`, so no screenshots of scrollback are needed.
 
 ## Evidence to capture
 
