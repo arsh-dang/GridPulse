@@ -10,7 +10,9 @@
     "dispatch-listener": "tsx src/dispatchListener.ts",
     "build": "tsc -b",
     "typecheck": "tsc --noEmit",
-    "surge": "tsx src/fleetSurge.ts"
+    "surge": "tsx src/fleetSurge.ts",
+    "test": "vitest run",
+    "edge-eval": "tsx src/experiments/edgeEval.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.658.1",
@@ -21,6 +23,7 @@
   "devDependencies": {
     "@types/node": "^22.7.5",
     "tsx": "^4.19.1",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.2"
   }
 }

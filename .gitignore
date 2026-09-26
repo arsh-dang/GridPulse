@@ -7,3 +7,4 @@ coverage/
 *.tsbuildinfo
 infra/aws/certs/
 infra/aws/out.env
+keys.pem

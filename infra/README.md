@@ -100,3 +100,8 @@ npm start -w @gridpulse/price-ingest-service
 bash infra/aws/99-teardown.sh
 ```
 Then terminate the build box.
+
+## HD experiments
+
+See [`EXPERIMENTS.md`](EXPERIMENTS.md) for the edge filtering experiments
+(`07-metrics.sh`, `08-run-experiment.sh`).

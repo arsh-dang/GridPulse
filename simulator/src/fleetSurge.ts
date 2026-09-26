@@ -3,51 +3,74 @@ import type { MqttClient } from "mqtt";
 import {
   BatteryTelemetrySchema,
   NemRegionSchema,
+  decide,
   type BatteryTelemetry,
+  type PolicyConfig,
   type PriceSpikeDetected,
   type PriceUpdated,
 } from "@gridpulse/shared";
 import { connectMqtt } from "./mqttClient.js";
+import { Fleet } from "./fleet/fleetModel.js";
+import { mulberry32 } from "./fleet/rng.js";
+import { ReportingPolicy, type PriceClass, type ReportingMode, type Trigger } from "./edge/reportingPolicy.js";
 
 /**
- * Load generator for the autoscaling demonstration.
+ * Fleet surge: load generator for the scaling experiments.
  *
- * Simulates a large battery fleet reporting through AWS IoT Core during a
- * price spike. Every battery publishes the same BatteryTelemetry contract as
- * batteryNode.ts, on the same topic layout, so the cloud side cannot tell it
- * apart from real devices. The only difference is volume.
+ * Simulates a battery fleet behind an edge gateway. Every battery is sampled
+ * in turn at SAMPLE_RATE samples per second (so each battery is sampled every
+ * BATTERIES / SAMPLE_RATE seconds). The gateway's reporting policy decides
+ * which samples are published to AWS IoT Core:
  *
- * AWS IoT Core allows 100 publishes per second per connection, so the fleet
- * is spread across several connections, the way many gateways would be.
+ *   EDGE_MODE=periodic   publish every sample (the 6.3D baseline)
+ *   EDGE_MODE=sod        send-on-delta with a heartbeat
+ *   EDGE_MODE=sod-aware  send-on-delta + price-class flush + SoC boundary triggers
  *
- *   TRANSPORT=iot  publish over MQTT to IoT Core (default, the real path)
- *   TRANSPORT=sqs  send straight to the SQS queue (fallback if the IoT rule
- *                  cannot be created in the Learner Lab)
+ * Published messages go through a per-connection token bucket, because AWS
+ * IoT Core allows 100 publishes per second per connection. A price-class
+ * flush therefore drains at the gateway's publish capacity, as it would on
+ * real hardware.
+ *
+ * Scenario: normal price ($120/MWh) until SPIKE_AT_S, then a $450/MWh spike,
+ * re-announced every minute, until the run ends.
  */
 const TRANSPORT = (process.env.TRANSPORT ?? "iot") as "iot" | "sqs";
 const REGION = NemRegionSchema.parse(process.env.REGION ?? "VIC");
 const BATTERIES = Number(process.env.BATTERIES ?? 5000);
-const RATE = Number(process.env.RATE ?? 400); // telemetry messages per second, whole fleet
+const SAMPLE_RATE = Number(process.env.SAMPLE_RATE ?? process.env.RATE ?? 800);
 const DURATION_S = Number(process.env.DURATION_S ?? 600);
-const CONNECTIONS = Number(process.env.CONNECTIONS ?? 8);
+const CONNECTIONS = Number(process.env.CONNECTIONS ?? 12);
+const PER_CONNECTION_LIMIT = Number(process.env.PER_CONNECTION_LIMIT ?? 90);
+const EDGE_MODE = (process.env.EDGE_MODE ?? "periodic") as ReportingMode;
+const DELTA = Number(process.env.DELTA ?? 0.01);
+const HEARTBEAT_S = Number(process.env.HEARTBEAT_S ?? 120);
+const SPIKE_AT_S = Number(process.env.SPIKE_AT_S ?? 0);
+const NORMAL_PRICE = 120;
 const SPIKE_PRICE = Number(process.env.SPIKE_PRICE ?? 450);
-const SPIKE_THRESHOLD = Number(process.env.SPIKE_THRESHOLD ?? 300);
-const IOT_PER_CONNECTION_LIMIT = 100;
 const TICK_MS = 100;
 
+const POLICY: PolicyConfig = {
+  spikeThresholdAudMwh: Number(process.env.SPIKE_THRESHOLD ?? 300),
+  cheapThresholdAudMwh: 50,
+  reserveSoc: 0.2,
+  fullSoc: 0.95,
+  maxKw: 5,
+  priceMaxAgeMs: 15 * 60_000,
+};
+
+interface Outgoing {
+  topic: string;
+  payload: object;
+}
+
 interface Sink {
-  send(topic: string, payloads: object[]): Promise<void>;
+  /** Messages this sink can accept in one tick. */
+  capacityPerTick(): number;
+  send(batch: Outgoing[]): Promise<void>;
   close(): Promise<void>;
 }
 
 async function iotSink(): Promise<Sink> {
-  const perConnection = RATE / CONNECTIONS;
-  if (perConnection > IOT_PER_CONNECTION_LIMIT * 0.9) {
-    throw new Error(
-      `RATE ${RATE} over ${CONNECTIONS} connections is ${perConnection.toFixed(0)}/s each; ` +
-        `IoT Core allows ${IOT_PER_CONNECTION_LIMIT}/s per connection. Raise CONNECTIONS.`,
-    );
-  }
   const run = Math.random().toString(36).slice(2, 6);
   const clients: MqttClient[] = await Promise.all(
     Array.from({ length: CONNECTIONS }, (_, i) => connectMqtt(`gridpulse-surge-${run}-${i}`)),
@@ -55,11 +78,9 @@ async function iotSink(): Promise<Sink> {
   console.log(`Connected ${clients.length} MQTT connections to ${process.env.MQTT_URL}`);
   let next = 0;
   return {
-    async send(topic, payloads) {
-      for (const p of payloads) {
-        const client = clients[next++ % clients.length];
-        client?.publish(topic.replace("{id}", (p as BatteryTelemetry).batteryId ?? ""), JSON.stringify(p), { qos: 0 });
-      }
+    capacityPerTick: () => Math.floor((CONNECTIONS * PER_CONNECTION_LIMIT * TICK_MS) / 1000),
+    async send(batch) {
+      for (const m of batch) clients[next++ % clients.length]?.publish(m.topic, JSON.stringify(m.payload), { qos: 0 });
     },
     async close() {
       await Promise.all(clients.map((c) => c.endAsync()));
@@ -72,19 +93,14 @@ function sqsSink(): Sink {
   if (!queueUrl) throw new Error("TRANSPORT=sqs needs QUEUE_URL");
   const sqs = new SQSClient({ region: process.env.AWS_REGION ?? "us-east-1" });
   return {
-    async send(_topic, payloads) {
-      const batches: object[][] = [];
-      for (let i = 0; i < payloads.length; i += 10) batches.push(payloads.slice(i, i + 10));
-      await Promise.all(
-        batches.map((b) =>
-          sqs.send(
-            new SendMessageBatchCommand({
-              QueueUrl: queueUrl,
-              Entries: b.map((p, i) => ({ Id: String(i), MessageBody: JSON.stringify(p) })),
-            }),
-          ),
-        ),
-      );
+    capacityPerTick: () => 400,
+    async send(batch) {
+      const chunks: Outgoing[][] = [];
+      for (let i = 0; i < batch.length; i += 10) chunks.push(batch.slice(i, i + 10));
+      await Promise.all(chunks.map((c) => sqs.send(new SendMessageBatchCommand({
+        QueueUrl: queueUrl,
+        Entries: c.map((m, i) => ({ Id: String(i), MessageBody: JSON.stringify(m.payload) })),
+      }))));
     },
     async close() {
       sqs.destroy();
@@ -92,90 +108,123 @@ function sqsSink(): Sink {
   };
 }
 
-function spikeEvents(): [PriceUpdated, PriceSpikeDetected] {
+function priceEvents(price: number): Outgoing[] {
   const intervalStart = new Date().toISOString();
-  return [
-    { type: "PriceUpdated", region: REGION, priceAudMwh: SPIKE_PRICE, intervalStart, source: "simulator" },
-    {
-      type: "PriceSpikeDetected",
-      region: REGION,
-      priceAudMwh: SPIKE_PRICE,
-      thresholdAudMwh: SPIKE_THRESHOLD,
-      intervalStart,
-      source: "simulator",
-    },
-  ];
+  const updated: PriceUpdated = { type: "PriceUpdated", region: REGION, priceAudMwh: price, intervalStart, source: "simulator" };
+  const out: Outgoing[] = [{ topic: `gridpulse/price/${REGION}`, payload: updated }];
+  if (price >= POLICY.spikeThresholdAudMwh) {
+    const spike: PriceSpikeDetected = {
+      type: "PriceSpikeDetected", region: REGION, priceAudMwh: price,
+      thresholdAudMwh: POLICY.spikeThresholdAudMwh, intervalStart, source: "simulator",
+    };
+    out.push({ topic: `gridpulse/spike/${REGION}`, payload: spike });
+  }
+  return out;
+}
+
+function classOf(p: number): PriceClass {
+  return p >= POLICY.spikeThresholdAudMwh ? "spike" : p <= POLICY.cheapThresholdAudMwh ? "cheap" : "normal";
 }
 
 async function main(): Promise<void> {
   const sink = TRANSPORT === "sqs" ? sqsSink() : await iotSink();
-  const socs = Array.from({ length: BATTERIES }, () => 0.4 + Math.random() * 0.5);
+  const fleet = new Fleet({ size: BATTERIES, region: REGION, seed: 42 });
+  const ids = fleet.batteries.map((b) => b.id);
+  const gateway = new ReportingPolicy({ mode: EDGE_MODE, delta: DELTA, heartbeatS: HEARTBEAT_S, boundaries: [POLICY.reserveSoc, POLICY.fullSoc] });
+  const samplePeriodS = BATTERIES / SAMPLE_RATE;
+
+  // Spread heartbeats across the fleet, as on a gateway that has been running for a while.
+  const phase = mulberry32(7);
+  const lastSampleS = new Float64Array(BATTERIES);
+  fleet.batteries.forEach((b, i) => {
+    gateway.prime(b.id, b.soc, -Math.floor(phase() * HEARTBEAT_S));
+    lastSampleS[i] = -samplePeriodS;
+  });
 
   console.log(
-    `Fleet surge: ${BATTERIES} batteries in ${REGION}, ${RATE} msg/s for ${DURATION_S}s via ${TRANSPORT}, ` +
-      `simulated spike $${SPIKE_PRICE}/MWh`,
+    `Fleet surge: ${BATTERIES} batteries in ${REGION}, ${SAMPLE_RATE} samples/s (each battery every ${samplePeriodS.toFixed(2)}s), ` +
+      `${DURATION_S}s via ${TRANSPORT}, edge mode ${EDGE_MODE}` +
+      (EDGE_MODE === "periodic" ? "" : ` (delta ${DELTA * 100}%, heartbeat ${HEARTBEAT_S}s)`) +
+      `, spike $${SPIKE_PRICE}/MWh at t=${SPIKE_AT_S}s, gateway capacity ${sink.capacityPerTick() * (1000 / TICK_MS)} msg/s`,
   );
 
-  // Announce the spike, and repeat it every minute so the optimiser keeps a
-  // fresh price for the whole run.
-  const announce = async (): Promise<void> => {
-    const [updated, spike] = spikeEvents();
-    await sink.send(`gridpulse/price/${REGION}`, [updated]);
-    await sink.send(`gridpulse/spike/${REGION}`, [spike]);
-  };
-  await announce();
-  const spikeTimer = setInterval(() => void announce(), 60_000);
-
-  let sent = 0;
-  let errors = 0;
-  let cursor = 0;
-  let carry = 0;
-  let lastSent = 0;
   const startedAt = Date.now();
+  const elapsedS = (): number => (Date.now() - startedAt) / 1000;
+  let price = SPIKE_AT_S > 0 ? NORMAL_PRICE : SPIKE_PRICE;
+  const outbox: Outgoing[] = [...priceEvents(price)];
+  gateway.onPrice(classOf(price), ids);
+
+  const announce = setInterval(() => outbox.unshift(...priceEvents(price)), 60_000);
+  const spikeTimer = SPIKE_AT_S > 0 ? setTimeout(() => {
+    price = SPIKE_PRICE;
+    outbox.unshift(...priceEvents(price));   // price events go out first
+    gateway.onPrice(classOf(price), ids);   // sod-aware: every battery reports on its next sample
+    console.log(`t=${elapsedS().toFixed(0)}s  price spike to $${price}/MWh announced`);
+  }, SPIKE_AT_S * 1000) : undefined;
+
+  let sampled = 0, published = 0, errors = 0, cursor = 0, carry = 0;
+  let lastSampled = 0, lastPublished = 0;
+  let sending = false;
 
   const tick = setInterval(() => {
-    carry += (RATE * TICK_MS) / 1000;
+    const now = elapsedS();
+    const hour = 17.5 + now / 3600;
+    const priceState = { priceAudMwh: price, intervalStart: new Date().toISOString() };
+
+    // 1. Sample the fleet and let the gateway filter.
+    carry += (SAMPLE_RATE * TICK_MS) / 1000;
     const n = Math.floor(carry);
     carry -= n;
-    const batch: BatteryTelemetry[] = [];
-    for (let i = 0; i < n; i++) {
-      const idx = cursor++ % BATTERIES;
-      const soc = Math.min(1, Math.max(0, (socs[idx] ?? 0.5) - Math.random() * 0.004));
-      socs[idx] = soc;
-      batch.push(
-        BatteryTelemetrySchema.parse({
-          type: "BatteryTelemetry",
-          batteryId: `battery-${REGION.toLowerCase()}-${idx + 1}`,
-          region: REGION,
-          soc: Number(soc.toFixed(4)),
-          solarKw: 0,
-          loadKw: Number((0.5 + Math.random() * 2.5).toFixed(2)),
-          ts: new Date().toISOString(),
-        }),
-      );
-    }
-    sink
-      .send(`gridpulse/${REGION}/{id}/telemetry`, batch)
-      .then(() => { sent += batch.length; })
-      .catch((err) => {
-        errors += batch.length;
-        console.error("send failed:", err instanceof Error ? err.message : err);
+    for (let k = 0; k < n; k++) {
+      const i = cursor++ % BATTERIES;
+      const b = fleet.batteries[i]!;
+      fleet.step(b, Math.max(0, now - lastSampleS[i]!), hour, POLICY.reserveSoc);
+      lastSampleS[i] = now;
+      sampled++;
+      if (!gateway.decide(b.id, b.soc, now)) continue;
+
+      const telemetry = BatteryTelemetrySchema.parse({
+        type: "BatteryTelemetry", batteryId: b.id, region: REGION,
+        soc: Number(b.soc.toFixed(4)), solarKw: 0, loadKw: Number(b.baseLoadKw.toFixed(2)),
+        ts: new Date().toISOString(),
       });
+      outbox.push({ topic: `gridpulse/${REGION}/${b.id}/telemetry`, payload: telemetry });
+
+      // The battery acts on the same decision the cloud will make for this reading.
+      const d = decide(telemetry, priceState, POLICY, new Date());
+      b.command = { action: d.action, targetKw: d.targetKw ?? 0 };
+    }
+
+    // 2. Publish within the gateway's rate limit.
+    if (sending || outbox.length === 0) return;
+    const batch = outbox.splice(0, sink.capacityPerTick());
+    sending = true;
+    sink.send(batch)
+      .then(() => { published += batch.length; })
+      .catch((err) => { errors += batch.length; console.error("send failed:", err instanceof Error ? err.message : err); })
+      .finally(() => { sending = false; });
   }, TICK_MS);
 
   const report = setInterval(() => {
-    const elapsed = Math.round((Date.now() - startedAt) / 1000);
-    console.log(`t=${String(elapsed).padStart(4)}s  sent=${sent}  rate=${Math.round((sent - lastSent) / 5)}/s  errors=${errors}`);
-    lastSent = sent;
+    const s = sampled - lastSampled, p = published - lastPublished;
+    lastSampled = sampled; lastPublished = published;
+    console.log(
+      `t=${String(Math.round(elapsedS())).padStart(4)}s  sampled=${sampled} published=${published} ` +
+        `rate=${Math.round(p / 5)}/s of ${Math.round(s / 5)}/s sampled  suppressed=${((1 - published / Math.max(1, sampled)) * 100).toFixed(1)}%  ` +
+        `outbox=${outbox.length}  errors=${errors}`,
+    );
   }, 5000);
 
   const stop = async (): Promise<void> => {
-    clearInterval(tick);
-    clearInterval(spikeTimer);
-    clearInterval(report);
+    clearInterval(tick); clearInterval(announce); clearInterval(report);
+    if (spikeTimer) clearTimeout(spikeTimer);
     await new Promise((r) => setTimeout(r, 1000));
     await sink.close();
-    console.log(`Done: ${sent} telemetry messages sent, ${errors} errors, ${Math.round((Date.now() - startedAt) / 1000)}s`);
+    const counts = Object.entries(gateway.counts).filter(([, v]) => v > 0).map(([k, v]) => `${k}=${v}`).join(" ");
+    console.log(
+      `Done: ${sampled} samples, ${published} messages published (${((1 - published / Math.max(1, sampled)) * 100).toFixed(1)}% suppressed), ` +
+        `${errors} errors, ${Math.round(elapsedS())}s. Triggers: ${counts || "n/a"}`,
+    );
     process.exit(0);
   };
   setTimeout(() => void stop(), DURATION_S * 1000);
@@ -186,3 +235,5 @@ main().catch((err) => {
   console.error("fleetSurge failed:", err instanceof Error ? err.message : err);
   process.exit(1);
 });
+
+export type { Trigger };

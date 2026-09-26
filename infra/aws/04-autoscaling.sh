@@ -5,6 +5,8 @@
 #   Scale in:  backlog plus new arrivals < 50 for 3 minutes, one task at a time.
 # Scaling in on "backlog plus arrivals" rather than backlog alone stops the
 # service shrinking while the load is still running but being kept up with.
+# FILL(..., 0) matters: SQS stops reporting NumberOfMessagesSent when nothing
+# is sent, and without it the sum is empty and the alarm never fires.
 source "$(dirname "$0")/common.sh"
 
 RESOURCE_ID="service/${CLUSTER}/${SERVICE}"
@@ -56,14 +58,14 @@ cat > /tmp/gridpulse-idle-metrics.json << JSON
   { "Id": "sent", "ReturnData": false, "MetricStat": { "Period": 60, "Stat": "Sum",
     "Metric": { "Namespace": "AWS/SQS", "MetricName": "NumberOfMessagesSent",
                 "Dimensions": [ { "Name": "QueueName", "Value": "$QUEUE_NAME" } ] } } },
-  { "Id": "idle", "Expression": "visible + sent", "Label": "Backlog plus arrivals per minute", "ReturnData": true }
+  { "Id": "idle", "Expression": "FILL(visible, 0) + FILL(sent, 0)", "Label": "Backlog plus arrivals per minute", "ReturnData": true }
 ]
 JSON
 aws cloudwatch put-metric-alarm --alarm-name gridpulse-backlog-idle \
   --alarm-description "Scale in: queue empty and no new events for 3 minutes" \
   --metrics file:///tmp/gridpulse-idle-metrics.json --evaluation-periods 3 \
   --threshold 50 --comparison-operator LessThanThreshold \
-  --treat-missing-data notBreaching --alarm-actions "$IN_ARN"
+  --treat-missing-data breaching --alarm-actions "$IN_ARN"
 echo "gridpulse-backlog-high, gridpulse-backlog-idle"
 
 step "CloudWatch dashboard 'gridpulse' (screenshot this during the demo)"
